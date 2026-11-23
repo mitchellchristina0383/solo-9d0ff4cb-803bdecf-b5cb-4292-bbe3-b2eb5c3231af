@@ -57,7 +57,7 @@
 <body>
 <header>
   <h1>五端口虚拟交换机</h1>
-  <span class="sub">按 VLAN 独立学习 MAC · 未知单播只泛洪本 VLAN · 暂停/放行出帧 · 带积压改配</span>
+  <span class="sub">按 VLAN 独立学习 MAC · 未知单播只泛洪本 VLAN · 暂停积压磁盘暂存（同帧多口只存一份）· 带积压改配</span>
   <span style="flex:1"></span>
   <button class="warn" id="resetBtn">复位交换机</button>
 </header>
@@ -75,6 +75,11 @@
   </section>
 
   <section id="ports"></section>
+
+  <section class="card">
+    <h2>磁盘暂存</h2>
+    <div id="spool" class="mono counts">（暂无数据）</div>
+  </section>
 
   <section class="card">
     <h2>MAC 地址表（各 VLAN 独立学习）</h2>
@@ -133,7 +138,7 @@ function buildPorts() {
     const counts = el("div", "", "counts"); counts.id = "counts" + i;
     card.appendChild(counts);
 
-    card.appendChild(el("h4", "待发队列（积压）"));
+    card.appendChild(el("h4", "待发队列（积压，卡片只显示队尾 10 帧，完整明细见 /api/state）"));
     const q = el("ul", null, "frames"); q.id = "queue" + i; card.appendChild(q);
     card.appendChild(el("h4", "已收到的帧"));
     const rv = el("ul", null, "frames"); rv.id = "recv" + i; card.appendChild(rv);
@@ -164,9 +169,23 @@ function render(st) {
       " · 改配丢弃累计 " + p.dropped_total;
 
     const q = $("queue" + i); q.textContent = "";
-    p.queue.forEach(f => q.appendChild(frameLi(f)));
+    // 端口卡片只取积压总数 + 队尾 10 帧；完整明细仍可从 /api/state 的 queue 字段查询
+    (p.queue_tail || []).forEach(f => q.appendChild(frameLi(f)));
+    if (p.queued > (p.queue_tail || []).length) {
+      const more = el("li", "… 其余 " + (p.queued - p.queue_tail.length) +
+        " 帧未在卡片展示，完整明细见 /api/state");
+      more.style.color = "var(--dim)";
+      q.prepend(more);
+    }
     const rv = $("recv" + i); rv.textContent = "";
     p.received.slice(-10).reverse().forEach(f => rv.appendChild(frameLi(f)));
+  }
+
+  const sp = $("spool");
+  if (st.spool) {
+    sp.textContent = "暂存目录 " + st.spool.dir + " · 磁盘帧内容 " + st.spool.blobs +
+      " 份 · 待发引用 " + st.spool.references + " 次（同帧多口共享一份）· 读缓存 " +
+      st.spool.cache_entries + "/" + st.spool.cache_limit + "（固定上限）";
   }
 
   const mt = $("macTables"); mt.textContent = "";

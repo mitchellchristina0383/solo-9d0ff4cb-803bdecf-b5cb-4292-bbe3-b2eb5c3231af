@@ -1,16 +1,22 @@
-"""端到端冒烟：起真实 HTTP 服务，跑「同址学习」「带积压改配」「并发改配+放行」。
+"""端到端冒烟：起真实 HTTP 服务，跑「同址学习」「带积压改配」「并发改配+放行」
+以及磁盘暂存场景「长积压放行 / 多口共用一份 / 写盘失败原子作废」。
 
 用法:  python scripts/smoke_http.py        （从仓库根目录运行）
+环境:  ENABLE_TEST_HOOKS=1 时额外验证 /api/test/fail-writes HTTP 钩子
 """
 
 import json
 import os
 import sys
 import threading
+import tempfile
 import urllib.request
 import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 在导入 app 之前打开故障注入钩子（容器内由 ENABLE_TEST_HOOKS=1 打开）
+os.environ["ENABLE_TEST_HOOKS"] = "1"
 
 from werkzeug.serving import make_server
 
@@ -160,10 +166,118 @@ def scenario_concurrent():
           [(p["id"], p["queued"], p["paused"]) for p in st["ports"]])
 
 
+def scenario_spool():
+    print("\n== 场景四：磁盘暂存（长积压放行 / 多口共用一份 / 写盘失败） ==")
+    post("/api/reset")
+
+    # --- 4.1 长积压放行：暂停口压入 600 帧，放行按 FIFO 全部交付，内存有界 ---
+    post("/api/port/2/pause")
+    N = 600
+    for i in range(N):
+        code, j = post("/api/frame", {"port": 1, "src": M1, "dst": M2,
+                                      "payload": "body-%04d" % i})
+        assert code == 200, j
+    st = state()
+    p2 = port(st, 2)
+    check("长积压：端口2积压 %d 帧" % N, p2["queued"] == N, p2["queued"])
+    check("卡片视图只给队尾 10 帧", len(p2["queue_tail"]) == 10, len(p2["queue_tail"]))
+    check("默认 /api/state 的 queue 仅元数据（自动刷新生存有界）",
+          len(p2["queue"]) == N and "payload" not in p2["queue"][0], p2["queue"][0])
+    check("读缓存不超过固定上限",
+          st["spool"]["cache_entries"] <= st["spool"]["cache_limit"], st["spool"])
+    # 完整明细走 ?full=1
+    st_full = req("GET", "/api/state?full=1")[1]
+    p2f = port(st_full, 2)
+    check("/api/state?full=1 含完整明细（%d 帧带 payload）" % N,
+          len(p2f["queue"]) == N and all("payload" in f for f in p2f["queue"]),
+          len(p2f["queue"]))
+    check("暂存引用数等于待发项总数", st["spool"]["references"] == N, st["spool"])
+
+    code, r = post("/api/port/2/release")
+    check("放行按序交付全部 %d 帧" % N, code == 200 and r["delivered"] == N, r)
+    st = state()
+    p2 = port(st, 2)
+    check("已收总数计入每一帧", p2["received_count"] == N, p2["received_count"])
+    check("明细只保留最近 500 帧", len(p2["received"]) == 500, len(p2["received"]))
+    seqs = [f["seq"] for f in p2["received"]]
+    check("放行顺序为 FIFO", seqs == sorted(seqs) and seqs[-1] == N, seqs[-3:])
+    check("全部待发项移除后磁盘帧内容回收",
+          st["spool"]["blobs"] == 0 and st["spool"]["references"] == 0, st["spool"])
+
+    # --- 4.2 多口共用：同一帧泛洪积压到多个暂停口，磁盘只存一份 ---
+    post("/api/reset")
+    post("/api/port/2/pause")
+    post("/api/port/3/pause")
+    post("/api/port/4/pause")
+    post("/api/port/5/pause")
+    code, r = post("/api/frame", {"port": 1, "src": M1, "dst": M3,
+                                  "payload": "shared-by-many"})
+    check("同一帧积压于 4 个端口", code == 200 and sorted(r["queued"]) == [2, 3, 4, 5], r)
+    st = state()
+    check("磁盘只存一份帧内容", st["spool"]["blobs"] == 1, st["spool"])
+    check("引用计数为 4（每口一处待发项）", st["spool"]["references"] == 4, st["spool"])
+    blob_ids = {p["queue_tail"][0]["blob_id"] for p in st["ports"] if p["queued"]}
+    check("四口待发项指向同一 blob", len(blob_ids) == 1, blob_ids)
+
+    # 只放行/改配其中两口：本口清理，共享内容仍被他口引用而保留
+    post("/api/port/2/release")
+    code, r = post("/api/port/3/vlan", {"vlan": 77})
+    check("改配只清理本口积压", r["dropped_queue"] == 1, r)
+    st = state()
+    check("他口仍引用时帧内容不回收",
+          st["spool"]["blobs"] == 1 and st["spool"]["references"] == 2, st["spool"])
+    post("/api/port/4/release")
+    st = state()
+    check("剩最后一口引用", st["spool"]["references"] == 1 and st["spool"]["blobs"] == 1,
+          st["spool"])
+    post("/api/port/5/release")
+    st = state()
+    check("最后一处待发项移除后回收帧内容",
+          st["spool"]["blobs"] == 0 and st["spool"]["references"] == 0, st["spool"])
+
+    # --- 4.3 写盘失败：网页拿到原因，整次发帧作废，各项状态原样 ---
+    post("/api/reset")
+    post("/api/port/2/pause")
+    code, good = post("/api/frame", {"port": 1, "src": M1, "dst": M2, "payload": "ok"})
+    check("故障前发帧成功", code == 200 and good["queued"] == [2], good)
+    st_before = state()
+
+    code, j = post("/api/test/fail-writes", {"enabled": True})
+    check("故障注入钩子可用（ENABLE_TEST_HOOKS=1）", code == 200, j)
+    code, j = post("/api/frame", {"port": 1, "src": M1, "dst": M3, "payload": "boom"})
+    check("写盘失败返回 400 并带原因", code == 400 and "暂存" in j["error"], (code, j))
+    post("/api/test/fail-writes", {"enabled": False})
+
+    st_after = state()
+    check("MAC 表保持原样", st_after["mac_tables"] == st_before["mac_tables"])
+    check("各口待发保持原样",
+          [p["queued"] for p in st_after["ports"]] ==
+          [p["queued"] for p in st_before["ports"]])
+    check("各口实收保持原样",
+          [p["received_count"] for p in st_after["ports"]] ==
+          [p["received_count"] for p in st_before["ports"]])
+    check("暂存引用与磁盘文件保持原样",
+          st_after["spool"] == st_before["spool"],
+          (st_before["spool"], st_after["spool"]))
+    # 帧号未推进：恢复后下一帧帧号接续故障前
+    code, r = post("/api/frame", {"port": 1, "src": M1, "dst": M3, "payload": "recovered"})
+    check("故障恢复后发帧正常", code == 200 and r["frame"]["seq"] == good["frame"]["seq"] + 1,
+          r)
+
+    # --- 4.4 复位清空暂存，重启从空交换机开始（目录由 Switch 初始化时清空） ---
+    post("/api/reset")
+    st = state()
+    check("复位清空暂存", st["spool"]["blobs"] == 0 and st["spool"]["references"] == 0,
+          st["spool"])
+    check("复位后无积压、无 MAC 表",
+          all(p["queued"] == 0 for p in st["ports"]) and st["mac_tables"] == {})
+
+
 def main():
     import logging
     logging.getLogger("werkzeug").setLevel(logging.ERROR)   # 只保留 PASS/FAIL 输出
-    sw = Switch()
+    spool_dir = tempfile.mkdtemp(prefix="smoke-spool-")
+    sw = Switch(spool_dir=spool_dir)
     server = make_server("127.0.0.1", 8765, create_app(sw), threaded=True)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -171,6 +285,7 @@ def main():
         scenario_same_address_learning()
         scenario_backlog_reconfig()
         scenario_concurrent()
+        scenario_spool()
     finally:
         server.shutdown()
     print(f"\n结果: {passed} 通过, {failed} 失败")

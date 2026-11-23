@@ -5,4 +5,14 @@ services:
     container_name: vlan-switch
     ports:
       - "8000:8000"
+    environment:
+      # 积压帧磁盘暂存目录（命名卷挂载，避免长积压耗尽容器内存）
+      SPOOL_DIR: /var/lib/vlan-switch/spool
+      # 开放 /api/test/fail-writes 故障注入钩子，便于在容器内自测写盘失败
+      ENABLE_TEST_HOOKS: "1"
+    volumes:
+      - switch-spool:/var/lib/vlan-switch/spool
     restart: unless-stopped
+
+volumes:
+  switch-spool:
